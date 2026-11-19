@@ -12,7 +12,26 @@ from google.adk.agents import llm_agent
 from google.adk import runners
 from google.adk.plugins import base_plugin
 
+from core.config import DEMO_SECRETS
 from core.utils import chat_with_agent
+
+
+_SENSITIVE_PATTERNS = {
+    "password": (
+        r"(?<!\w)[*_\x60]{0,3}(?:password|mật\s+khẩu)[*_\x60]{0,3}\s*"
+        r"""(?:[:=](?:[*_]{1,3}(?=\s))?\s*|(?:is|là)\s+(?=["'\x60]|\S*[0-9!@#$%^&*+=]))"""
+        r"""(?:"[^"\r\n]+"|'[^'\r\n]+'|\x60[^\x60\r\n]+\x60|\S+?(?=[,;]?(?:\s|$)))"""
+    ),
+    "api_key": r"\bsk-[a-z0-9_-]+",
+    "email": r"(?<![\w.+%'-])[\w.+%'-]+@[\w-]+(?:\.[\w-]+)*\.[a-z]{2,}\b",
+    "phone": r"(?<!\w)(?:0|\+84)(?:[ .-]?[0-9]){9,10}(?!\w)",
+    "national_id": r"\b(?:[0-9]{9}|[0-9]{12})\b",
+}
+if DEMO_SECRETS:
+    _SENSITIVE_PATTERNS["demo_secret"] = "|".join(
+        re.escape(secret) + (r"(?::[0-9]+)?" if "." in secret else "")
+        for secret in sorted(DEMO_SECRETS, key=len, reverse=True)
+    )
 
 
 # ============================================================
@@ -28,7 +47,7 @@ from core.utils import chat_with_agent
 # ============================================================
 
 def content_filter(response: str) -> dict:
-    """Filter response for PII, secrets, and harmful content.
+    """Filter response for PII and secrets.
 
     Args:
         response: The LLM's response text
@@ -39,21 +58,10 @@ def content_filter(response: str) -> dict:
     issues = []
     redacted = response
 
-    # PII patterns to check
-    PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
-    }
-
-    for name, pattern in PII_PATTERNS.items():
-        matches = re.findall(pattern, response, re.IGNORECASE)
-        if matches:
-            issues.append(f"{name}: {len(matches)} found")
-            redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
+    for name, pattern in _SENSITIVE_PATTERNS.items():
+        redacted, count = re.subn(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
+        if count:
+            issues.append(f"{name}: {count} found")
 
     return {
         "safe": len(issues) == 0,
@@ -154,7 +162,7 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         """Extract text from LLM response."""
         text = ""
         if hasattr(llm_response, "content") and llm_response.content:
-            for part in llm_response.content.parts:
+            for part in llm_response.content.parts or []:
                 if hasattr(part, "text") and part.text:
                     text += part.text
         return text
@@ -172,16 +180,21 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        result = content_filter(response_text)
+        safe_text = result["redacted"]
+        if not result["safe"]:
+            self.redacted_count += 1
 
-        return llm_response  # TODO: modify if needed
+        if self.use_llm_judge and not (await llm_safety_check(safe_text))["safe"]:
+            self.blocked_count += 1
+            safe_text = "Blocked: the response did not pass the safety check."
+
+        if safe_text != response_text:
+            llm_response.content = types.Content(
+                role=llm_response.content.role,
+                parts=[types.Part.from_text(text=safe_text)],
+            )
+        return llm_response
 
 
 # ============================================================
@@ -202,10 +215,10 @@ def test_content_filter():
         "Contact us at 0901234567 or email test@vinbank.com for details.",
     ]
     print("Testing content_filter():")
-    for resp in test_responses:
+    for case_number, resp in enumerate(test_responses, start=1):
         result = content_filter(resp)
         status = "SAFE" if result["safe"] else "ISSUES FOUND"
-        print(f"  [{status}] '{resp[:60]}...'")
+        print(f"  [{status}] Case {case_number}")
         if result["issues"]:
             print(f"           Issues: {result['issues']}")
             print(f"           Redacted: {result['redacted'][:80]}...")
